@@ -1205,7 +1205,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         w13_weight = ModelWeightParameter(
             data=torch.empty(
                 num_experts,
-                2 * intermediate_size_per_partition,
+                (2 if self.moe.is_act_and_mul else 1) * intermediate_size_per_partition,
                 # 2 fp4 items are packed in the input dimension
                 hidden_size // 2,
                 dtype=weight_dtype,
@@ -1234,7 +1234,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         w13_weight_scale = ModelWeightParameter(
             data=torch.empty(
                 num_experts,
-                2 * intermediate_size_per_partition,
+                (2 if self.moe.is_act_and_mul else 1) * intermediate_size_per_partition,
                 # 2 fp4 items are packed in the input dimension
                 hidden_size // self.quant_config.group_size,
                 dtype=weight_scale_dtype,
@@ -1264,7 +1264,9 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         )
 
         w13_weight_scale_2 = PerTensorScaleParameter(
-            data=torch.empty(num_experts, 2, dtype=torch.float32),
+            data=torch.empty(
+                num_experts, 2 if self.moe.is_act_and_mul else 1, dtype=torch.float32
+            ),
             weight_loader=weight_loader,
         )
         layer.register_parameter("w13_weight_scale_2", w13_weight_scale_2)
@@ -1285,7 +1287,11 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         global_scale_num_experts = global_num_experts if use_global_sf else num_experts
 
         w13_input_scale = PerTensorScaleParameter(
-            data=torch.empty(global_scale_num_experts, 2, dtype=torch.float32),
+            data=torch.empty(
+                global_scale_num_experts,
+                2 if self.moe.is_act_and_mul else 1,
+                dtype=torch.float32,
+            ),
             weight_loader=weight_loader,
         )
         layer.register_parameter("w13_input_scale", w13_input_scale)
@@ -1301,9 +1307,13 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         gemm1_weight = layer.w13_weight.data
         gemm1_weight_scale = layer.w13_weight_scale.data
 
-        if self.allow_flashinfer and (
-            self.flashinfer_moe_backend == FlashinferMoeBackend.CUTLASS
-            or self.flashinfer_moe_backend == FlashinferMoeBackend.TENSORRT_LLM
+        if (
+            self.allow_flashinfer
+            and (
+                self.flashinfer_moe_backend == FlashinferMoeBackend.CUTLASS
+                or self.flashinfer_moe_backend == FlashinferMoeBackend.TENSORRT_LLM
+            )
+            and self.moe.is_act_and_mul
         ):
             gemm1_weight, gemm1_weight_scale = reorder_w1w3_to_w3w1(
                 gemm1_weight, gemm1_weight_scale, dim=-2
@@ -1313,7 +1323,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         layer.w13_weight_scale = Parameter(gemm1_weight_scale, requires_grad=False)
 
         # Common processing for w13_weight_scale_2
-        if not torch.allclose(
+        if self.moe.is_act_and_mul and not torch.allclose(
             layer.w13_weight_scale_2[:, 0], layer.w13_weight_scale_2[:, 1]
         ):
             logger.warning_once(
@@ -1473,8 +1483,6 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         logical_to_physical_map: torch.Tensor | None = None,
         logical_replica_count: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        assert activation == "silu", "Only SiLU activation is supported."
-
         if (
             self.allow_flashinfer
             and self.flashinfer_moe_backend == FlashinferMoeBackend.TENSORRT_LLM
