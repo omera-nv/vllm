@@ -1443,7 +1443,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
                 # and pad them individually
                 assert not self.moe.is_act_and_mul, (
                     "The intermediate size required padding, "
-                    "but padding is not implemented for non-gated activations"
+                    "but padding is not implemented for gated activations"
                 )
 
                 layer.w13_weight = Parameter(
