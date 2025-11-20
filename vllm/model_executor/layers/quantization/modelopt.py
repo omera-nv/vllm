@@ -111,6 +111,10 @@ class ModelOptQuantConfigBase(QuantizationConfig):
         super().__init__()
         self.exclude_modules: list[str] = exclude_modules
 
+    @property
+    def is_block_quant(self) -> bool:
+        raise NotImplementedError
+
     def is_layer_excluded(self, prefix: str) -> bool:
         """
         Check if a layer should be excluded from quantization.
@@ -594,45 +598,82 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_weight", w2_weight)
 
         if self.quant_config.is_checkpoint_fp8_serialized:
-            # WEIGHT SCALES - Per-tensor scaling for ModelOpts
-            # For gated MoE, allocate 2 scales for w1 and w3 respectively.
-            # They will be combined to a single scale after weight loading.
-            # For non-gated MoE, allocate 1 scale for w13.
-            if self.moe.is_act_and_mul:
-                w13_weight_scale_shape = (num_experts, 2)
+            if self.quant_config.is_block_quant:
+                assert self.quant_config.block_size is not None
+                layer.weight_block_size = self.quant_config.block_size
+                block_n, block_k = self.quant_config.block_size
+
+                # BLOCK SCALES
+                w13_weight_scale = BlockQuantScaleParameter(
+                    data=torch.ones(
+                        num_experts,
+                        (2 if self.moe.is_act_and_mul else 1)
+                        * ((intermediate_size_per_partition + block_n - 1) // block_n),
+                        1,
+                        (hidden_size + block_k - 1) // block_k,
+                        1,
+                        dtype=torch.float32,
+                    ),
+                    input_dim=1,
+                    output_dim=0,
+                    weight_loader=weight_loader,
+                )
+                layer.register_parameter("w13_weight_scale", w13_weight_scale)
+                w2_weight_scale = BlockQuantScaleParameter(
+                    data=torch.ones(
+                        num_experts,
+                        (hidden_size + block_n - 1) // block_n,
+                        1,
+                        (intermediate_size_per_partition + block_k - 1) // block_k,
+                        1,
+                        dtype=torch.float32,
+                    ),
+                    input_dim=1,
+                    output_dim=0,
+                    weight_loader=weight_loader,
+                )
+                layer.register_parameter("w2_weight_scale", w2_weight_scale)
+
             else:
-                w13_weight_scale_shape = (num_experts, 1)
-            w13_weight_scale = PerTensorScaleParameter(
-                data=torch.full(
-                    w13_weight_scale_shape,
-                    1.0,
-                    dtype=torch.float32,
-                ),
-                weight_loader=weight_loader,
-            )
-            w2_weight_scale = PerTensorScaleParameter(
-                data=torch.full((num_experts,), 1.0, dtype=torch.float32),
-                weight_loader=weight_loader,
-            )
-            layer.register_parameter("w13_weight_scale", w13_weight_scale)
-            layer.register_parameter("w2_weight_scale", w2_weight_scale)
+                # WEIGHT SCALES - Per-tensor scaling for ModelOpts
+                # For gated MoE, allocate 2 scales for w1 and w3 respectively.
+                # They will be combined to a single scale after weight loading.
+                # For non-gated MoE, allocate 1 scale for w13.
+                if self.moe.is_act_and_mul:
+                    w13_weight_scale_shape = (num_experts, 2)
+                else:
+                    w13_weight_scale_shape = (num_experts, 1)
+                w13_weight_scale = PerTensorScaleParameter(
+                    data=torch.full(
+                        w13_weight_scale_shape,
+                        1.0,
+                        dtype=torch.float32,
+                    ),
+                    weight_loader=weight_loader,
+                )
+                w2_weight_scale = PerTensorScaleParameter(
+                    data=torch.full((num_experts,), 1.0, dtype=torch.float32),
+                    weight_loader=weight_loader,
+                )
+                layer.register_parameter("w13_weight_scale", w13_weight_scale)
+                layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
-            # Set weight loader attributes for scales
-            extra_weight_attrs.update(
-                {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
-            )
+                # Set weight loader attributes for scales
+                extra_weight_attrs.update(
+                    {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
+                )
 
-            # INPUT SCALES - Per-tensor scaling for ModelOpt
-            w13_input_scale = PerTensorScaleParameter(
-                data=torch.full((num_experts,), 1.0, dtype=torch.float32),
-                weight_loader=weight_loader,
-            )
-            w2_input_scale = PerTensorScaleParameter(
-                data=torch.full((num_experts,), 1.0, dtype=torch.float32),
-                weight_loader=weight_loader,
-            )
-            layer.register_parameter("w13_input_scale", w13_input_scale)
-            layer.register_parameter("w2_input_scale", w2_input_scale)
+                # INPUT SCALES - Per-tensor scaling for ModelOpt
+                w13_input_scale = PerTensorScaleParameter(
+                    data=torch.full((num_experts,), 1.0, dtype=torch.float32),
+                    weight_loader=weight_loader,
+                )
+                w2_input_scale = PerTensorScaleParameter(
+                    data=torch.full((num_experts,), 1.0, dtype=torch.float32),
+                    weight_loader=weight_loader,
+                )
+                layer.register_parameter("w13_input_scale", w13_input_scale)
+                layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Process FP8 MoE weights after loading from serialized checkpoint.
@@ -866,6 +907,10 @@ class ModelOptNvFp4Config(ModelOptQuantConfigBase):
     @classmethod
     def get_min_capability(cls) -> int:
         return 80
+
+    @property
+    def is_block_quant(self) -> bool:
+        return True
 
     @classmethod
     def override_quantization_method(

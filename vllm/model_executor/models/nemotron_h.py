@@ -679,14 +679,11 @@ class NemotronHModel(nn.Module):
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
-                    if (
-                        ("in_proj" in name or "up_proj" in name)
-                        and "scale" in name
-                        and len(loaded_weight.shape) > 1
-                    ):
-                        # this is a column parallel block scale
-                        # fall through first if of weight_loader_v2
+                    if "in_proj.weight_scale" in name and len(loaded_weight.shape) > 1:
+                        # mamba in_proj is kept in a single weight
+                        # pass 0 to fall through the first if of weight_loader_v2
                         weight_loader(param, loaded_weight, 0)
+
                     else:
                         weight_loader(param, loaded_weight)
 

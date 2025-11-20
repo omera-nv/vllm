@@ -32,7 +32,9 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
     RoutingMethodType,
 )
-from vllm.model_executor.layers.fused_moe.fused_moe import zero_experts_compute_triton
+from vllm.model_executor.layers.fused_moe.fused_moe import (
+    zero_experts_compute_triton,
+)
 from vllm.model_executor.layers.fused_moe.modular_kernel import (
     FusedMoEPermuteExpertsUnpermute,
     FusedMoEPrepareAndFinalize,
@@ -1215,8 +1217,12 @@ class FusedMoE(CustomOp):
             is_per_tensor = (
                 "weight_scale_2" in weight_name
                 if uses_weight_scale_2
-                else "weight_scale" in weight_name
+                else (
+                    "weight_scale" in weight_name
+                    and not self.quant_method.quant_config.is_block_quant
+                )
             ) or "input_scale" in weight_name
+
             if is_per_tensor:
                 self._load_per_tensor_weight_scale(
                     shard_id=shard_id,
@@ -1238,7 +1244,7 @@ class FusedMoE(CustomOp):
                     self._load_combined_w13_weight_scale(
                         shard_dim=shard_dim,
                         loaded_weight=loaded_weight,
-                        param=param,
+                        param=expert_data,
                         tp_rank=self.tp_rank,
                     )
                     return True if return_success else None
