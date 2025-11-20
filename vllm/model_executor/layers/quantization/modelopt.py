@@ -69,7 +69,11 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     Fp8LinearOp,
     requantize_with_max_scale,
 )
-from vllm.model_executor.parameter import ModelWeightParameter, PerTensorScaleParameter
+from vllm.model_executor.parameter import (
+    BlockQuantScaleParameter,
+    ModelWeightParameter,
+    PerTensorScaleParameter,
+)
 from vllm.scalar_type import scalar_types
 from vllm.utils.flashinfer import (
     flashinfer_scaled_fp4_mm,
@@ -275,11 +279,13 @@ class ModelOptFp8Config(ModelOptQuantConfigBase):
 
     def __init__(
         self,
+        quant_method: str,
         is_checkpoint_fp8_serialized: bool,
         kv_cache_quant_method: str | None,
         exclude_modules: list[str],
     ) -> None:
         super().__init__(exclude_modules)
+        self.quant_method = quant_method
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         self.kv_cache_quant_method = kv_cache_quant_method
         if is_checkpoint_fp8_serialized:
@@ -297,6 +303,16 @@ class ModelOptFp8Config(ModelOptQuantConfigBase):
     @classmethod
     def get_min_capability(cls) -> int:
         return 89
+
+    @property
+    def is_block_quant(self) -> bool:
+        return self.quant_method == "fp8_pb_wo"
+
+    @property
+    def block_size(self) -> tuple[int, int] | None:
+        if self.quant_method == "fp8_pb_wo":
+            return (128, 128)
+        return None
 
     @classmethod
     def override_quantization_method(
@@ -342,7 +358,12 @@ class ModelOptFp8Config(ModelOptQuantConfigBase):
     ) -> "ModelOptFp8Config":
         is_checkpoint_fp8_serialized = "FP8" in quant_method.upper()
 
-        return cls(is_checkpoint_fp8_serialized, kv_cache_quant_method, exclude_modules)
+        return cls(
+            quant_method,
+            is_checkpoint_fp8_serialized,
+            kv_cache_quant_method,
+            exclude_modules,
+        )
 
 
 class ModelOptFp8LinearMethod(LinearMethodBase):
@@ -395,21 +416,41 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         layer.register_parameter("weight", weight)
 
         if self.quant_config.is_checkpoint_fp8_serialized:
-            # WEIGHT SCALE
-            weight_scale = PerTensorScaleParameter(
-                data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
-                weight_loader=weight_loader,
-            )
-            weight_scale[:] = torch.finfo(torch.float32).min
-            layer.register_parameter("weight_scale", weight_scale)
-            # INPUT SCALE
-            scale = PerTensorScaleParameter(
-                data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
-                weight_loader=weight_loader,
-            )
+            if self.quant_config.is_block_quant:
+                # BLOCK SCALE
+                assert self.quant_config.block_size is not None
+                layer.weight_block_size = self.quant_config.block_size
+                block_n, block_k = self.quant_config.block_size
+                weight_scale = BlockQuantScaleParameter(
+                    data=torch.empty(
+                        (output_size_per_partition + block_n - 1) // block_n,
+                        1,
+                        (input_size_per_partition + block_k - 1) // block_k,
+                        1,
+                        dtype=torch.float32,
+                    ),
+                    input_dim=1,
+                    output_dim=0,
+                    weight_loader=weight_loader,
+                )
+                weight_scale[:] = torch.finfo(torch.float32).min
+                layer.register_parameter("weight_scale", weight_scale)
+            else:
+                # WEIGHT SCALE
+                weight_scale = PerTensorScaleParameter(
+                    data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+                    weight_loader=weight_loader,
+                )
+                weight_scale[:] = torch.finfo(torch.float32).min
+                layer.register_parameter("weight_scale", weight_scale)
+                # INPUT SCALE
+                scale = PerTensorScaleParameter(
+                    data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+                    weight_loader=weight_loader,
+                )
 
-            scale[:] = torch.finfo(torch.float32).min
-            layer.register_parameter("input_scale", scale)
+                scale[:] = torch.finfo(torch.float32).min
+                layer.register_parameter("input_scale", scale)
 
     def process_weights_after_loading(self, layer: Module) -> None:
         weight = layer.weight
