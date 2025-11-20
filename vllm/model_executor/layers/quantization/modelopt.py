@@ -82,7 +82,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-QUANT_ALGOS = ["FP8", "NVFP4"]
+QUANT_ALGOS = ["FP8", "NVFP4", "fp8_pb_wo"]
 KV_CACHE_QUANT_ALGOS = ["FP8"]
 
 
@@ -340,7 +340,7 @@ class ModelOptFp8Config(ModelOptQuantConfigBase):
         original_config: dict[str, Any],
         **kwargs: Any,
     ) -> "ModelOptFp8Config":
-        is_checkpoint_fp8_serialized = "FP8" in quant_method
+        is_checkpoint_fp8_serialized = "FP8" in quant_method.upper()
 
         return cls(is_checkpoint_fp8_serialized, kv_cache_quant_method, exclude_modules)
 
