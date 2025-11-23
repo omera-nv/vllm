@@ -53,6 +53,7 @@ from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
     select_cutlass_fp8_gemm_impl,
     swap_w13_to_w31,
 )
+from vllm.model_executor.layers.quantization.utils.fp8_utils import W8A8BlockFp8LinearOp
 from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
     apply_fp4_marlin_linear,
     is_fp4_marlin_supported,
@@ -67,6 +68,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     Fp8LinearOp,
+    cutlass_block_fp8_supported,
     requantize_with_max_scale,
 )
 from vllm.model_executor.parameter import (
@@ -384,9 +386,18 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
 
     def __init__(self, quant_config: ModelOptFp8Config) -> None:
         self.quant_config = quant_config
-        self.fp8_linear = Fp8LinearOp(
-            act_quant_static=True, act_quant_group_shape=GroupShape.PER_TENSOR
-        )
+        if self.quant_config.is_block_quant:
+            assert self.quant_config.block_size is not None
+            self.w8a8_block_fp8_linear = W8A8BlockFp8LinearOp(
+                weight_group_shape=GroupShape(*self.quant_config.block_size),
+                act_quant_group_shape=GroupShape(1, self.quant_config.block_size[0]),
+                cutlass_block_fp8_supported=cutlass_block_fp8_supported(),
+                use_aiter_and_is_supported=False,
+            )
+        else:
+            self.fp8_linear = Fp8LinearOp(
+                act_quant_static=True, act_quant_group_shape=GroupShape.PER_TENSOR
+            )
 
     def create_weights(
         self,
@@ -439,6 +450,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
                 )
                 weight_scale[:] = torch.finfo(torch.float32).min
                 layer.register_parameter("weight_scale", weight_scale)
+                layer.register_parameter("input_scale", None)
             else:
                 # WEIGHT SCALE
                 weight_scale = PerTensorScaleParameter(
@@ -457,15 +469,21 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
                 layer.register_parameter("input_scale", scale)
 
     def process_weights_after_loading(self, layer: Module) -> None:
-        weight = layer.weight
-        max_w_scale = layer.weight_scale.max()
-        if not (layer.weight_scale == layer.weight_scale[0]).all():
-            max_w_scale, weight = requantize_with_max_scale(
-                layer.weight, layer.weight_scale, layer.logical_widths
+        if self.quant_config.is_block_quant:
+            layer.weight_scale = Parameter(
+                layer.weight_scale.squeeze(), requires_grad=False
             )
-        layer.weight = Parameter(weight.t(), requires_grad=False)
-        layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
-        layer.input_scale = Parameter(layer.input_scale.max(), requires_grad=False)
+
+        if not self.quant_config.is_block_quant:
+            weight = layer.weight
+            max_w_scale = layer.weight_scale.max()
+            if not (layer.weight_scale == layer.weight_scale[0]).all():
+                max_w_scale, weight = requantize_with_max_scale(
+                    layer.weight, layer.weight_scale, layer.logical_widths
+                )
+            layer.weight = Parameter(weight.t(), requires_grad=False)
+            layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
+            layer.input_scale = Parameter(layer.input_scale.max(), requires_grad=False)
 
     def apply(
         self,
@@ -473,13 +491,23 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.fp8_linear.apply(
-            input=x,
-            weight=layer.weight,
-            weight_scale=layer.weight_scale,
-            input_scale=layer.input_scale,
-            bias=bias,
-        )
+        if self.quant_config.is_block_quant:
+            return self.w8a8_block_fp8_linear.apply(
+                input=x,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                input_scale=layer.input_scale,
+                bias=bias,
+            )
+
+        else:
+            return self.fp8_linear.apply(
+                input=x,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                input_scale=layer.input_scale,
+                bias=bias,
+            )
 
 
 class ModelOptFp8MoEMethod(FusedMoEMethodBase):
@@ -633,6 +661,8 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                     weight_loader=weight_loader,
                 )
                 layer.register_parameter("w2_weight_scale", w2_weight_scale)
+                layer.w13_input_scale = None
+                layer.w2_input_scale = None
 
             else:
                 # WEIGHT SCALES - Per-tensor scaling for ModelOpts
@@ -676,12 +706,49 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                 layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        layer.w13_weight = Parameter(layer.w13_weight.data, requires_grad=False)
+        layer.w2_weight = Parameter(layer.w2_weight.data, requires_grad=False)
+
+        if self.quant_config.is_block_quant:
+            self._process_weights_after_loading_blockscale(layer)
+        else:
+            self._process_weights_after_loading_per_tensor(layer)
+
+    def _process_weights_after_loading_blockscale(self, layer: torch.nn.Module) -> None:
+        w13_weight = layer.w13_weight
+        w2_weight = layer.w2_weight
+
+        block_shape = self.quant_config.block_size
+        assert block_shape is not None
+
+        layer.w13_weight_scale = Parameter(
+            layer.w13_weight_scale.squeeze(), requires_grad=False
+        )
+        layer.w2_weight_scale = Parameter(
+            layer.w2_weight_scale.squeeze(), requires_grad=False
+        )
+
+        required_padding = w13_weight.size(-2) % block_shape[0]
+        if required_padding != 0:
+            layer.w13_weight = Parameter(
+                torch.nn.functional.pad(w13_weight, (0, 0, 0, required_padding)),
+                requires_grad=False,
+            )
+            layer.w2_weight = Parameter(
+                torch.nn.functional.pad(w2_weight, (0, required_padding, 0, 0)),
+                requires_grad=False,
+            )
+
+        if self.flashinfer_moe_backend is not None:
+            if self.moe.is_act_and_mul:
+                layer.w13_weight.data = swap_w13_to_w31(layer.w13_weight.data)
+            if self.flashinfer_moe_backend == FlashinferMoeBackend.TENSORRT_LLM:
+                rotate_flashinfer_fp8_moe_weights(layer.w13_weight, layer.w2_weight)
+
+    def _process_weights_after_loading_per_tensor(self, layer: torch.nn.Module) -> None:
         """Process FP8 MoE weights after loading from serialized checkpoint.
         Only supports pre-quantized checkpoints with FP8 weights and scales.
         """
-
-        layer.w13_weight = Parameter(layer.w13_weight.data, requires_grad=False)
-        layer.w2_weight = Parameter(layer.w2_weight.data, requires_grad=False)
 
         from vllm._custom_ops import scaled_fp8_quant
         from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
@@ -755,6 +822,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                 layer.w13_weight.data = swap_w13_to_w31(layer.w13_weight.data)
             if self.flashinfer_moe_backend == FlashinferMoeBackend.TENSORRT_LLM:
                 rotate_flashinfer_fp8_moe_weights(layer.w13_weight, layer.w2_weight)
+
         register_moe_scaling_factors(layer)
 
     def get_fused_moe_quant_config(
@@ -763,17 +831,28 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         if self.flashinfer_moe_backend == FlashinferMoeBackend.TENSORRT_LLM:
             return None
 
-        return fp8_w8a8_moe_quant_config(
-            w1_scale=layer.w13_weight_scale,
-            g1_alphas=layer.output1_scales_gate_scalar.squeeze(),
-            w2_scale=layer.w2_weight_scale,
-            g2_alphas=layer.output2_scales_scalar.squeeze(),
-            a1_scale=layer.w13_input_scale,
-            a1_gscale=layer.w13_input_scale,
-            a2_scale=layer.w2_input_scale,
-            a2_gscale=layer.w2_input_scale_inv,
-            per_act_token_quant=False,
-        )
+        if self.quant_config.is_block_quant:
+            assert self.quant_config.block_size is not None
+            block_shape = list(self.quant_config.block_size)
+            return fp8_w8a8_moe_quant_config(
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                a1_scale=layer.w13_input_scale,
+                a2_scale=layer.w2_input_scale,
+                block_shape=block_shape,
+            )
+        else:
+            return fp8_w8a8_moe_quant_config(
+                w1_scale=layer.w13_weight_scale,
+                g1_alphas=layer.output1_scales_gate_scalar.squeeze(),
+                w2_scale=layer.w2_weight_scale,
+                g2_alphas=layer.output2_scales_scalar.squeeze(),
+                a1_scale=layer.w13_input_scale,
+                a1_gscale=layer.w13_input_scale,
+                a2_scale=layer.w2_input_scale,
+                a2_gscale=layer.w2_input_scale_inv,
+                per_act_token_quant=False,
+            )
 
     def apply(
         self,
@@ -807,18 +886,49 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             assert activation == "silu", (
                 f"Expected 'silu' activation but got {activation}"
             )
-            assert not renormalize
-            return apply_flashinfer_per_tensor_scale_fp8(
-                layer=layer,
-                hidden_states=x,
-                router_logits=router_logits,
-                routing_bias=e_score_correction_bias,
-                global_num_experts=global_num_experts,
-                top_k=top_k,
-                num_expert_group=num_expert_group,
-                topk_group=topk_group,
-                apply_router_weight_on_input=apply_router_weight_on_input,
-            )
+            if self.quant_config.is_block_quant:
+                import vllm.model_executor.layers.fused_moe.flashinfer_trtllm_moe  # noqa: E501, F401
+
+                e_score_correction_bias = (
+                    e_score_correction_bias.to(x.dtype)
+                    if e_score_correction_bias is not None
+                    else None
+                )
+                routing_method_type = layer.routing_method_type
+                return torch.ops.vllm.flashinfer_fused_moe_blockscale_fp8(
+                    routing_logits=router_logits.to(torch.float32)
+                    if routing_method_type == RoutingMethodType.DeepSeekV3
+                    else router_logits,
+                    routing_bias=e_score_correction_bias,
+                    x=x,
+                    w13_weight=layer.w13_weight,
+                    w13_weight_scale_inv=layer.w13_weight_scale,
+                    w2_weight=layer.w2_weight,
+                    w2_weight_scale_inv=layer.w2_weight_scale,
+                    global_num_experts=global_num_experts,
+                    top_k=top_k,
+                    num_expert_group=num_expert_group,
+                    topk_group=topk_group,
+                    intermediate_size=layer.intermediate_size_per_partition,
+                    expert_offset=layer.ep_rank * layer.local_num_experts,
+                    local_num_experts=layer.local_num_experts,
+                    block_shape=self.quant_config.block_size,
+                    routing_method_type=routing_method_type,
+                    routed_scaling=routed_scaling_factor,
+                )
+            else:
+                assert not renormalize
+                return apply_flashinfer_per_tensor_scale_fp8(
+                    layer=layer,
+                    hidden_states=x,
+                    router_logits=router_logits,
+                    routing_bias=e_score_correction_bias,
+                    global_num_experts=global_num_experts,
+                    top_k=top_k,
+                    num_expert_group=num_expert_group,
+                    topk_group=topk_group,
+                    apply_router_weight_on_input=apply_router_weight_on_input,
+                )
 
         # Expert selection
         topk_weights, topk_ids, _ = FusedMoE.select_experts(
