@@ -471,7 +471,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: Module) -> None:
         if self.quant_config.is_block_quant:
             layer.weight_scale = Parameter(
-                layer.weight_scale.squeeze(), requires_grad=False
+                layer.weight_scale.reciprocal().squeeze(), requires_grad=False
             )
 
         if not self.quant_config.is_block_quant:
@@ -722,10 +722,10 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         assert block_shape is not None
 
         layer.w13_weight_scale = Parameter(
-            layer.w13_weight_scale.squeeze(), requires_grad=False
+            layer.w13_weight_scale.reciprocal().squeeze(), requires_grad=False
         )
         layer.w2_weight_scale = Parameter(
-            layer.w2_weight_scale.squeeze(), requires_grad=False
+            layer.w2_weight_scale.reciprocal().squeeze(), requires_grad=False
         )
 
         required_padding = w13_weight.size(-2) % block_shape[0]
@@ -961,6 +961,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                 global_num_experts=global_num_experts,
                 expert_map=expert_map,
                 apply_router_weight_on_input=apply_router_weight_on_input,
+                use_deepseek_fp8_block_scale=self.quant_config.is_block_quant,
             )
         else:
             from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts
@@ -979,6 +980,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                 global_num_experts=global_num_experts,
                 expert_map=expert_map,
                 apply_router_weight_on_input=apply_router_weight_on_input,
+                allow_cutlass_block_scaled_grouped_gemm=self.quant_config.is_block_quant,
             )
 
 
