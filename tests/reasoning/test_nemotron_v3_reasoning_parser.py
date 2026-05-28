@@ -85,6 +85,15 @@ def tokenizer():
             },
             id="with_start_token_streaming",
         ),
+        pytest.param(
+            False,
+            {
+                "output": "<think>This is a reasoning section",
+                "reasoning": "This is a reasoning section",
+                "content": None,
+            },
+            id="without_end_token",
+        ),
     ],
 )
 def test_nemotron_v3_reasoning(
