@@ -24,13 +24,7 @@ repos:
     exclude: 'csrc/(moe/topk_softmax_kernels.cu|quantization/gguf/(ggml-common.h|dequantize.cuh|vecdotq.cuh|mmq.cuh|mmvq.cuh))|vllm/third_party/.*'
     types_or: [c++, cuda]
     args: [--style=file, --verbose]
-- repo: https://github.com/DavidAnson/markdownlint-cli2
-  rev: v0.21.0
-  hooks:
-  - id: markdownlint-cli2
-    language_version: lts
-    args: [--fix]
-    exclude: ^CLAUDE\.md$
+
 - repo: https://github.com/rhysd/actionlint
   rev: v1.7.7
   hooks:
