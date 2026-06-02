@@ -1004,6 +1004,7 @@ async def benchmark(
             "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
             "max_concurrent_requests": metrics.max_concurrent_requests,
             "rtfx": metrics.rtfx,
+            "routed_experts": [output.routed_experts for output in outputs],
         }
     else:
         result = {
