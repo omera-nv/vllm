@@ -1980,6 +1980,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
             "itls",
             "generated_texts",
             "errors",
+            "routed_experts",
         ]:
             if field in result_json:
                 del result_json[field]
