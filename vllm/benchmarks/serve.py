@@ -607,34 +607,33 @@ def calculate_metrics(
     return metrics, actual_output_lens
 
 
-def _process_routed_experts_blobs(blobs: list[str | None]) -> list[dict[int, int]]:
+def _process_routed_experts_blobs(blobs: list[str | None]) -> dict[int, dict[int, int]]:
     """
     Parse the base64 blobs returned by the server.
     Each blob is a numpy array of [num_tokens, num_layers, topk],
     showing which experts were active for each layer and token in the output.
 
-    Return a mapping of expert id to the number of activations for each request.
+    Return a mapping of layer id -> expert id -> number of activations for all requests.
     """
-    routed_experts_per_req = []
+    routed_experts_per_layer = {}
 
     for blob in blobs:
         if blob is None:
-            routed_experts_per_req.append({})
             continue
 
         # num_tokens, num_layers, topk
         routed_experts = np.load(io.BytesIO(base64.b64decode(blob)))
-        expert_ids, expert_hits = np.unique(
-            routed_experts.reshape((routed_experts.shape[0], -1)), return_counts=True
-        )
-        routed_experts_per_req.append(
-            {
-                expert_id: hits
-                for expert_id, hits in zip(expert_ids.tolist(), expert_hits.tolist())
-            }
-        )
+        # num_layers, num_experts
+        expert_ids, expert_hits = np.unique(routed_experts, return_counts=True, axis=1)
+        for layer_id, (expert_id, hits) in enumerate(zip(expert_ids, expert_hits)):
+            if layer_id not in routed_experts_per_layer:
+                routed_experts_per_layer[layer_id] = {}
 
-    return routed_experts_per_req
+            routed_experts_per_layer[layer_id][expert_id] = (
+                routed_experts_per_layer[layer_id].get(expert_id, 0) + hits
+            )
+
+    return routed_experts_per_layer
 
 
 async def benchmark(
