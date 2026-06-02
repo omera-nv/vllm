@@ -607,15 +607,18 @@ def calculate_metrics(
     return metrics, actual_output_lens
 
 
-def _process_routed_experts_blobs(blobs: list[str | None]) -> dict[int, dict[int, int]]:
+def _process_routed_experts_blobs(blobs: list[str | None]) -> list[list[int]]:
     """
     Parse the base64 blobs returned by the server.
     Each blob is a numpy array of [num_tokens, num_layers, topk],
     showing which experts were active for each layer and token in the output.
 
-    Return a mapping of layer id -> expert id -> number of activations for all requests.
+    Return the hits for each expert in each layer.
     """
-    routed_experts_per_layer = {}
+    # will deduce from blobs
+    num_layers = num_experts = 0
+
+    sum_expert_hits_per_layer = np.zeros((num_layers, num_experts))
 
     for blob in blobs:
         if blob is None:
@@ -623,22 +626,35 @@ def _process_routed_experts_blobs(blobs: list[str | None]) -> dict[int, dict[int
 
         # num_tokens, num_layers, topk
         routed_experts = np.load(io.BytesIO(base64.b64decode(blob)))
+
+        num_layers = max(sum_expert_hits_per_layer.shape[0], routed_experts.shape[1])
+        num_experts = max(sum_expert_hits_per_layer.shape[1], int(routed_experts.max()))
+
         # num_layers, num_experts
-        expert_ids_all_layers, expert_hits_all_layers = np.unique(
-            routed_experts, return_counts=True, axis=1
+        expert_hits_per_layer = (
+            np.eye(num_experts)[routed_experts].sum(axis=-2).sum(axis=0)
         )
-        for layer_id, (expert_ids, expert_hits) in enumerate(
-            zip(expert_ids_all_layers.tolist(), expert_hits_all_layers.tolist())
-        ):
-            if layer_id not in routed_experts_per_layer:
-                routed_experts_per_layer[layer_id] = {}
 
-            for expert_id, hits in zip(expert_ids, expert_hits):
-                routed_experts_per_layer[layer_id][expert_id] = (
-                    routed_experts_per_layer[layer_id].get(expert_id, 0) + hits
-                )
+        # pad incoming data and cumulative data so they have the shape
+        # most of the time this will be a noop
+        sum_expert_hits_per_layer = np.pad(
+            sum_expert_hits_per_layer,
+            (
+                (0, num_layers - sum_expert_hits_per_layer.shape[0]),
+                (0, num_experts - sum_expert_hits_per_layer.shape[1]),
+            ),
+        )
+        expert_hits_per_layer = np.pad(
+            expert_hits_per_layer,
+            (
+                (0, num_layers - expert_hits_per_layer.shape[0]),
+                (0, num_experts - expert_hits_per_layer.shape[1]),
+            ),
+        )
 
-    return routed_experts_per_layer
+        sum_expert_hits_per_layer += expert_hits_per_layer
+
+    return sum_expert_hits_per_layer.tolist()
 
 
 async def benchmark(
