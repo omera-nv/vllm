@@ -625,7 +625,9 @@ def _process_routed_experts_blobs(blobs: list[str | None]) -> dict[int, dict[int
         routed_experts = np.load(io.BytesIO(base64.b64decode(blob)))
         # num_layers, num_experts
         expert_ids, expert_hits = np.unique(routed_experts, return_counts=True, axis=1)
-        for layer_id, (expert_id, hits) in enumerate(zip(expert_ids, expert_hits)):
+        for layer_id, (expert_id, hits) in enumerate(
+            zip(expert_ids.tolist(), expert_hits.tolist())
+        ):
             if layer_id not in routed_experts_per_layer:
                 routed_experts_per_layer[layer_id] = {}
 
