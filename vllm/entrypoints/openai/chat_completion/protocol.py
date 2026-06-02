@@ -133,6 +133,11 @@ class ChatCompletionResponseStreamChoice(OpenAIBaseModel):
     stop_reason: int | str | None = None
     # not part of the OpenAI spec but for tracing the tokens
     token_ids: list[int] | None = None
+    # Per-token expert routing decisions, base64-encoded ``.npy`` bytes. Set
+    # only on the terminal chunk (where ``finish_reason`` is non-null), since
+    # the routing data for the whole sequence is concatenated on finish. See
+    # ``ChatCompletionResponseChoice.routed_experts`` for the decoded shape.
+    routed_experts: str | None = None
 
 
 class ChatCompletionStreamResponse(OpenAIBaseModel):

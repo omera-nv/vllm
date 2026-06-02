@@ -2,14 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
-import io
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
 from typing import TYPE_CHECKING, cast
 
-import numpy as np
-import pybase64 as base64
 from fastapi import Request
 
 from vllm.engine.protocol import EngineClient
@@ -34,7 +31,11 @@ from vllm.entrypoints.openai.engine.serving import (
     clamp_prompt_logprobs,
 )
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
-from vllm.entrypoints.utils import get_max_tokens, should_include_usage
+from vllm.entrypoints.utils import (
+    encode_routed_experts,
+    get_max_tokens,
+    should_include_usage,
+)
 from vllm.exceptions import VLLMValidationError
 from vllm.inputs import EngineInput
 from vllm.logger import init_logger
@@ -415,6 +416,14 @@ class OpenAIServingCompletion(OpenAIServing):
                             )
                         ],
                     )
+                    # Stamp routing data only when present (terminal chunk,
+                    # where the engine concatenates the per-token routing data
+                    # for the whole sequence). Setting it unconditionally would
+                    # add ``"routed_experts":null`` to every streamed chunk.
+                    if output.routed_experts is not None:
+                        chunk.choices[0].routed_experts = encode_routed_experts(
+                            output.routed_experts
+                        )
                     # Stamp on terminal chunk only when no trailing usage chunk
                     # will follow (that one is the true final message).
                     if (
@@ -541,17 +550,7 @@ class OpenAIServingCompletion(OpenAIServing):
                 else:
                     logprobs = None
 
-                # Encode routed_experts for transport. JSON can't carry raw
-                # bytes, so we write the ndarray as a ``.npy`` byte stream
-                # and base64-encode it. ``pybase64`` is ~3x faster than the
-                # stdlib ``base64`` on large payloads thanks to SIMD.
-                routed_experts_b64 = None
-                if output.routed_experts is not None:
-                    buf = io.BytesIO()
-                    np.save(buf, output.routed_experts)
-                    routed_experts_b64 = base64.b64encode(buf.getvalue()).decode(
-                        "ascii"
-                    )
+                routed_experts_b64 = encode_routed_experts(output.routed_experts)
 
                 choice_data = CompletionResponseChoice(
                     index=len(choices),

@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
-import io
 import json
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
@@ -10,8 +9,6 @@ from collections.abc import Sequence as GenericSequence
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Final
 
-import numpy as np
-import pybase64 as base64
 from fastapi import Request
 
 from vllm.engine.protocol import EngineClient
@@ -62,7 +59,11 @@ from vllm.entrypoints.openai.parser.harmony_utils import (
     parse_chat_output,
 )
 from vllm.entrypoints.openai.utils import maybe_filter_parallel_tool_calls
-from vllm.entrypoints.utils import get_max_tokens, should_include_usage
+from vllm.entrypoints.utils import (
+    encode_routed_experts,
+    get_max_tokens,
+    should_include_usage,
+)
 from vllm.inputs import EngineInput
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob
@@ -917,6 +918,14 @@ class OpenAIServingChat(OpenAIServing):
                         choices=[choice_data],
                         model=model_name,
                     )
+                    # Stamp routing data only when present (terminal chunk,
+                    # where the engine concatenates the per-token routing data
+                    # for the whole sequence). Setting it unconditionally would
+                    # add ``"routed_experts":null`` to every streamed chunk.
+                    if output.routed_experts is not None:
+                        chunk.choices[0].routed_experts = encode_routed_experts(
+                            output.routed_experts
+                        )
                     # Stamp the fingerprint on terminal chunks only (those with
                     # finish_reason set). When ``include_usage`` is on, the
                     # trailing usage chunk below overrides this as the true
@@ -1089,18 +1098,6 @@ class OpenAIServingChat(OpenAIServing):
                         content=content,
                     )
 
-                # Encode routed_experts for transport. JSON can't carry raw
-                # bytes, so we write the ndarray as a ``.npy`` byte stream
-                # and base64-encode it. ``pybase64`` is ~3x faster than the
-                # stdlib ``base64`` on large payloads thanks to SIMD.
-                routed_experts_b64 = None
-                if output.routed_experts is not None:
-                    buf = io.BytesIO()
-                    np.save(buf, output.routed_experts)
-                    routed_experts_b64 = base64.b64encode(buf.getvalue()).decode(
-                        "ascii"
-                    )
-
                 choice_data = ChatCompletionResponseChoice(
                     index=output.index,
                     message=message,
@@ -1116,7 +1113,7 @@ class OpenAIServingChat(OpenAIServing):
                     token_ids=(
                         as_list(output.token_ids) if request.return_token_ids else None
                     ),
-                    routed_experts=routed_experts_b64,
+                    routed_experts=encode_routed_experts(output.routed_experts),
                 )
                 choices.append(choice_data)
                 continue
@@ -1325,16 +1322,6 @@ class OpenAIServingChat(OpenAIServing):
                 and output.finish_reason == "stop"
             )
 
-            # Encode routed_experts for transport. JSON can't carry raw
-            # bytes, so we write the ndarray as a ``.npy`` byte stream
-            # and base64-encode it. ``pybase64`` is ~3x faster than the
-            # stdlib ``base64`` on large payloads thanks to SIMD.
-            routed_experts_b64 = None
-            if output.routed_experts is not None:
-                buf = io.BytesIO()
-                np.save(buf, output.routed_experts)
-                routed_experts_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-
             choice_data = ChatCompletionResponseChoice(
                 index=output.index,
                 message=message,
@@ -1348,7 +1335,7 @@ class OpenAIServingChat(OpenAIServing):
                 token_ids=(
                     as_list(output.token_ids) if request.return_token_ids else None
                 ),
-                routed_experts=routed_experts_b64,
+                routed_experts=encode_routed_experts(output.routed_experts),
             )
             choice_data = maybe_filter_parallel_tool_calls(choice_data, request)
 

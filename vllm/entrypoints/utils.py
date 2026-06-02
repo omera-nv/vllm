@@ -4,13 +4,15 @@
 import asyncio
 import dataclasses
 import functools
+import io
 import os
 from argparse import Namespace
 from http import HTTPStatus
 from logging import Logger
 from string import Template
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+import pybase64 as base64
 import regex as re
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -29,7 +31,25 @@ from vllm.logger import current_formatter_type, init_logger
 from vllm.platforms import current_platform
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
+if TYPE_CHECKING:
+    import numpy as np
+
 logger = init_logger(__name__)
+
+
+def encode_routed_experts(routed_experts: "np.ndarray | None") -> str | None:
+    """Encode routed_experts for transport. JSON can't carry raw bytes, so we
+    write the ndarray as a ``.npy`` byte stream and base64-encode it.
+    ``pybase64`` is ~3x faster than the stdlib ``base64`` on large payloads
+    thanks to SIMD. Returns ``None`` when there is no routing data."""
+    if routed_experts is None:
+        return None
+    import numpy as np
+
+    buf = io.BytesIO()
+    np.save(buf, routed_experts)
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
 
 VLLM_SUBCMD_PARSER_EPILOG = (
     "For full list:            vllm {subcmd} --help=all\n"

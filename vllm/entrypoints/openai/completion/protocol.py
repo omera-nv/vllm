@@ -531,6 +531,11 @@ class CompletionResponseStreamChoice(OpenAIBaseModel):
     # prompt tokens is put into choice to align with CompletionResponseChoice
     prompt_token_ids: list[int] | None = None
     token_ids: list[int] | None = None
+    # Per-token expert routing decisions, base64-encoded ``.npy`` bytes. Set
+    # only on the terminal chunk (where ``finish_reason`` is non-null), since
+    # the routing data for the whole sequence is concatenated on finish. See
+    # ``CompletionResponseChoice.routed_experts`` for the decoded shape.
+    routed_experts: str | None = None
 
 
 class CompletionStreamResponse(OpenAIBaseModel):
