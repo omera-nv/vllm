@@ -99,7 +99,7 @@ class RequestFuncOutput:
     start_time: float = 0.0
     input_audio_duration: float = 0.0  # in seconds
     # expert ids per-layer per-output-token
-    routed_experts: list[list[int]] = []
+    routed_experts: list[list[int]] = field(default_factory=list)
 
 
 class RequestFunc(Protocol):
