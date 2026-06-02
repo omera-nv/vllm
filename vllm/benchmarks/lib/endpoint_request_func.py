@@ -14,8 +14,6 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
 import aiohttp
-import numpy as np
-import pybase64 as base64
 import regex as re
 from tqdm.asyncio import tqdm
 
@@ -98,8 +96,8 @@ class RequestFuncOutput:
     error: str = ""
     start_time: float = 0.0
     input_audio_duration: float = 0.0  # in seconds
-    # expert ids per-layer per-output-token
-    routed_experts: list[list[int]] = field(default_factory=list)
+    # see entrypoints/openai/completion/protocol.py
+    routed_experts_blob: str | None = None
 
 
 class RequestFunc(Protocol):
@@ -194,7 +192,6 @@ async def async_request_openai_completions(
     output.prompt_len = request_func_input.prompt_len
 
     generated_text = ""
-    routed_experts_blob = None
     st = time.perf_counter()
     output.start_time = st
     most_recent_timestamp = st
@@ -244,10 +241,10 @@ async def async_request_openai_completions(
                                 generated_text += text or ""
 
                                 if routed_experts := choices[0].get("routed_experts"):
-                                    assert routed_experts_blob is None, (
+                                    assert output.routed_experts_blob is None, (
                                         "Expected a single routed_experts blob"
                                     )
-                                    routed_experts_blob = routed_experts
+                                    output.routed_experts_blob = routed_experts
 
                             elif usage := data.get("usage"):
                                 output.output_tokens = usage.get("completion_tokens")
@@ -263,10 +260,6 @@ async def async_request_openai_completions(
                     )
                 output.generated_text = generated_text
                 output.latency = most_recent_timestamp - st
-                if routed_experts_blob is not None:
-                    output.routed_experts = np.load(
-                        io.BytesIO(base64.b64decode(routed_experts_blob))
-                    ).tolist()
             else:
                 output.error = response.reason or ""
                 output.success = False

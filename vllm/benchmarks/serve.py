@@ -22,6 +22,7 @@ import argparse
 import asyncio
 import contextlib
 import importlib.util
+import io
 import json
 import os
 import random
@@ -39,6 +40,7 @@ from typing import Any, Literal
 
 import aiohttp
 import numpy as np
+import pybase64 as base64
 from tqdm.asyncio import tqdm
 
 from vllm.benchmarks.datasets import SampleRequest, add_dataset_parser, get_samples
@@ -605,6 +607,36 @@ def calculate_metrics(
     return metrics, actual_output_lens
 
 
+def _process_routed_experts_blobs(blobs: list[str | None]) -> list[dict[int, int]]:
+    """
+    Parse the base64 blobs returned by the server.
+    Each blob is a numpy array of [num_tokens, num_layers, topk],
+    showing which experts were active for each layer and token in the output.
+
+    Return a mapping of expert id to the number of activations for each request.
+    """
+    routed_experts_per_req = []
+
+    for blob in blobs:
+        if blob is None:
+            routed_experts_per_req.append({})
+            continue
+
+        # num_tokens, num_layers, topk
+        routed_experts = np.load(io.BytesIO(base64.b64decode(blob)))
+        expert_ids, expert_hits = np.unique(
+            routed_experts.reshape((routed_experts.shape[0], -1)), return_counts=True
+        )
+        routed_experts_per_req.append(
+            {
+                expert_id: hits
+                for expert_id, hits in zip(expert_ids.tolist(), expert_hits.tolist())
+            }
+        )
+
+    return routed_experts_per_req
+
+
 async def benchmark(
     task_type: TaskType,
     endpoint_type: str,
@@ -1004,7 +1036,9 @@ async def benchmark(
             "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
             "max_concurrent_requests": metrics.max_concurrent_requests,
             "rtfx": metrics.rtfx,
-            "routed_experts": [output.routed_experts for output in outputs],
+            "routed_experts": _process_routed_experts_blobs(
+                [output.routed_experts_blob for output in outputs]
+            ),
         }
     else:
         result = {
