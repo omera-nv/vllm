@@ -628,7 +628,9 @@ def _process_routed_experts_blobs(blobs: list[str | None]) -> list[list[int]]:
         routed_experts = np.load(io.BytesIO(base64.b64decode(blob)))
 
         num_layers = max(sum_expert_hits_per_layer.shape[0], routed_experts.shape[1])
-        num_experts = max(sum_expert_hits_per_layer.shape[1], int(routed_experts.max()))
+        num_experts = max(
+            sum_expert_hits_per_layer.shape[1], int(routed_experts.max()) + 1
+        )
 
         # num_layers, num_experts
         expert_hits_per_layer = (
