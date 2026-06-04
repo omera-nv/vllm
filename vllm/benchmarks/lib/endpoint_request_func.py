@@ -198,16 +198,29 @@ async def async_request_openai_completions(
     try:
         async with session.post(url=api_url, json=payload, headers=headers) as response:
             if response.status == 200:
+                # PHASE 1 — drain the socket as fast as possible, doing NO
+                # parsing in the receive loop. At high decode throughput, parsing
+                # each chunk inline lets the client fall behind, which fills the
+                # TCP buffers and backpressures the server mid-generation (the
+                # engine stalls on writes and the measured ITL reflects the
+                # client's parse rate, not the true token rate). Here we only
+                # record each chunk's arrival time and its raw bytes.
+                raw_chunks: list[tuple[float, bytes]] = []
+                async for chunk_bytes in response.content.iter_any():
+                    raw_chunks.append((time.perf_counter(), chunk_bytes))
+
+                # PHASE 2 — the stream is fully drained; parse the accumulated
+                # chunks now. TTFT/ITL use each chunk's recorded arrival time, so
+                # deferring the parse does not distort the latency metrics (it
+                # actually removes the previous parse-lag skew).
                 first_chunk_received = False
                 handler = StreamedResponseHandler()
-
-                async for chunk_bytes in response.content.iter_any():
+                for recv_timestamp, chunk_bytes in raw_chunks:
                     chunk_bytes = chunk_bytes.strip()
                     if not chunk_bytes:
                         continue
 
-                    messages = handler.add_chunk(chunk_bytes)
-                    for message in messages:
+                    for message in handler.add_chunk(chunk_bytes):
                         # NOTE: SSE comments (often used as pings) start with
                         # a colon. These are not JSON data payload and should
                         # be skipped.
@@ -226,18 +239,18 @@ async def async_request_openai_completions(
                                 # Note that text could be empty here
                                 # e.g. for special tokens
                                 text = choices[0].get("text")
-                                timestamp = time.perf_counter()
                                 # First token
                                 if not first_chunk_received:
                                     first_chunk_received = True
-                                    ttft = time.perf_counter() - st
-                                    output.ttft = ttft
+                                    output.ttft = recv_timestamp - st
 
                                 # Decoding phase
                                 else:
-                                    output.itl.append(timestamp - most_recent_timestamp)
+                                    output.itl.append(
+                                        recv_timestamp - most_recent_timestamp
+                                    )
 
-                                most_recent_timestamp = timestamp
+                                most_recent_timestamp = recv_timestamp
                                 generated_text += text or ""
 
                                 if routed_experts := choices[0].get("routed_experts"):
