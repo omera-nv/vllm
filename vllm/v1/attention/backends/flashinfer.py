@@ -840,6 +840,27 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.paged_kv_indices = self._make_buffer(max_num_pages)
         self.paged_kv_last_page_len = self._make_buffer(max_num_reqs)
 
+        # Ring of pinned CPU source buffers for the paged-KV metadata.
+        # On coherent-memory systems (e.g. GB10) `non_blocking=True` H2D is
+        # genuinely async even from *unpinned* memory (no pageable sync-fallback),
+        # so a single reused CPU buffer races step N's in-flight copies (the
+        # native H2D below *and* the FlashInfer plan() copies that read these
+        # buffers) against step N+1's writes. A ring (depth = concurrent in-flight
+        # steps) gives each step its own source buffer. `.gpu` stays a single
+        # fixed buffer, so cudagraph capture is unaffected.
+        self._paged_kv_ring_depth = max(2, vllm_config.max_concurrent_batches)
+        self._paged_kv_indptr_cpu_ring = [
+            torch.zeros(max_num_reqs + 1, dtype=torch.int32, pin_memory=True)
+            for _ in range(self._paged_kv_ring_depth)
+        ]
+        self._paged_kv_last_page_len_cpu_ring = [
+            torch.zeros(max_num_reqs, dtype=torch.int32, pin_memory=True)
+            for _ in range(self._paged_kv_ring_depth)
+        ]
+        self._paged_kv_ring_idx = 0
+        self._cur_indptr_cpu = self._paged_kv_indptr_cpu_ring[0]
+        self._cur_last_page_len_cpu = self._paged_kv_last_page_len_cpu_ring[0]
+
     # Keep SM90 prefill/decode Q dtype selection in one place.
     def get_q_data_type(self, is_prefill: bool) -> torch.dtype:
         # The user sets --attention-config.disable_flashinfer_q_quantization
@@ -1072,22 +1093,28 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
 
         Returns paged_kv_indices, a GPU tensor with shape [num_actual_pages].
         """
+        # Rotate to this step's pinned CPU source buffers (see __init__ ring note).
+        self._paged_kv_ring_idx = (
+            self._paged_kv_ring_idx + 1
+        ) % self._paged_kv_ring_depth
+        self._cur_indptr_cpu = self._paged_kv_indptr_cpu_ring[self._paged_kv_ring_idx]
+        self._cur_last_page_len_cpu = self._paged_kv_last_page_len_cpu_ring[
+            self._paged_kv_ring_idx
+        ]
+
         # write self.paged_kv_indptr_cpu inplace (0-index is always 0)
         np.cumsum(
             num_blocks_np,
             dtype=np.int32,
             out=self.paged_kv_indptr.np[1 : num_reqs + 1],
         )
-        # NOTE(woosuk): Because self.paged_kv_indptr_cpu can be modified
-        # after this line (e.g., for cuda graphs), we need to copy the data to
-        # self.paged_kv_indptr_buffer to avoid race condition.
-        self.paged_kv_indptr_cpu_buffer[: num_reqs + 1] = self.paged_kv_indptr.cpu[
-            : num_reqs + 1
-        ]
+        # Mirror into this step's ring buffer (CPU->CPU, synchronous), then async
+        # H2D from the ring buffer to the fixed .gpu target. The ring buffer is
+        # also the CPU source handed to plan() below, so nothing plan reads gets
+        # overwritten by the next step while its copy is still in flight.
+        self._cur_indptr_cpu.copy_(self.paged_kv_indptr.cpu)
         paged_kv_indptr = self.paged_kv_indptr.gpu[: num_reqs + 1]
-        paged_kv_indptr.copy_(
-            self.paged_kv_indptr_cpu_buffer[: num_reqs + 1], non_blocking=True
-        )
+        paged_kv_indptr.copy_(self._cur_indptr_cpu[: num_reqs + 1], non_blocking=True)
 
         # write self.paged_kv_indices inplace
         num_actual_pages = self.paged_kv_indptr.np[num_reqs]
@@ -1107,8 +1134,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             page_size,
             paged_kv_last_page_len_np,
         )
+        self._cur_last_page_len_cpu.copy_(self.paged_kv_last_page_len.cpu)
         self.paged_kv_last_page_len.gpu[:num_reqs].copy_(
-            self.paged_kv_last_page_len.cpu[:num_reqs], non_blocking=True
+            self._cur_last_page_len_cpu[:num_reqs], non_blocking=True
         )
         return paged_kv_indices
 
@@ -1225,11 +1253,20 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
 
         # Guard access to seq_lens_cpu, which may not always be needed
         # and can be expensive to retrieve in async mode.
-        # When all attention (both prefill and decode) uses TRTLLM,
-        # seq_lens_cpu is not needed since TRTLLM paths use GPU tensors
-        # (block_tables, seq_lens) directly.
-        needs_seq_lens_cpu = self.use_dcp or use_cascade or not all_uses_trtllm
-        seq_lens_cpu = common_attn_metadata.seq_lens_cpu if needs_seq_lens_cpu else None
+        if self.use_dcp or use_cascade:
+            # NOTE: this sync will void async scheduling
+            seq_lens_cpu = common_attn_metadata.seq_lens.cpu()
+        elif not all_uses_trtllm:
+            # the cpu seq lens are only used for calculating the paged kv indptr
+            # so assuming the upper bound will over-allocate at most 1 kv cache block.
+            # the kernel uses seq_lens to drive the attn calculation
+            seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
+        else:
+            # When all attention (both prefill and decode) uses TRTLLM,
+            # seq_lens_cpu is not needed since TRTLLM paths use GPU tensors
+            # (block_tables, seq_lens) directly.
+            seq_lens_cpu = None
+
         seq_lens_np = seq_lens_cpu.numpy() if seq_lens_cpu is not None else None
         num_blocks_np = (
             (seq_lens_np + (page_size - 1)) // page_size
@@ -1311,8 +1348,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             num_blocks_np -= num_common_kv_blocks
 
             assert paged_kv_indices is not None
-            paged_kv_indptr_cpu = self.paged_kv_indptr.cpu[: 1 + num_reqs]
-            paged_kv_last_page_len_cpu = self.paged_kv_last_page_len.cpu[:num_reqs]
+            paged_kv_indptr_cpu = self._cur_indptr_cpu[: 1 + num_reqs]
+            paged_kv_last_page_len_cpu = self._cur_last_page_len_cpu[:num_reqs]
 
             attn_metadata.cascade_wrapper = self._get_cascade_wrapper()
             # Cascade attention must use the same q dtype for prefill and decode
@@ -1388,11 +1425,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             else:
                 prefill_wrapper = self._get_prefill_wrapper(causal=attn_metadata.causal)
                 # Slicing CPU buffers that are only needed for FI native prefills
-                paged_kv_last_page_len_prefill_cpu = self.paged_kv_last_page_len.cpu[
+                paged_kv_last_page_len_prefill_cpu = self._cur_last_page_len_cpu[
                     prefill_start:num_reqs
                 ]
                 assert paged_kv_last_page_len_prefill_cpu.shape[0] == num_prefills
-                paged_kv_indptr_prefill_cpu = self.paged_kv_indptr.cpu[
+                paged_kv_indptr_prefill_cpu = self._cur_indptr_cpu[
                     prefill_start : num_reqs + 1
                 ]
                 assert paged_kv_indptr_prefill_cpu.shape[0] == num_prefills + 1
@@ -1492,11 +1529,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 )
                 fast_plan_decode(
                     decode_wrapper,
-                    indptr_cpu=self.paged_kv_indptr.cpu[: num_input_tokens + 1],
+                    indptr_cpu=self._cur_indptr_cpu[: num_input_tokens + 1],
                     indices=paged_kv_indices,
-                    last_page_len_cpu=self.paged_kv_last_page_len.cpu[
-                        :num_input_tokens
-                    ],
+                    last_page_len_cpu=self._cur_last_page_len_cpu[:num_input_tokens],
                     num_qo_heads=self.num_qo_heads * self.dcp_world_size,
                     num_kv_heads=self.num_kv_heads,
                     head_dim=self.head_dim,
